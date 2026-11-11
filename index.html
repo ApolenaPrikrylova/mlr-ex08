@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Leaf classifier</title>
+<style>
+  :root { --bg:#fff; --fg:#1b1f1c; --muted:#5d665f; --bar:#2e8b57; --track:#e4eae6; --card:#f4f7f5; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111513; --fg:#e8eee9; --muted:#9aa59d; --bar:#4cc17f; --track:#26302a; --card:#1a201d; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.4 -apple-system, system-ui, sans-serif; padding:0 16px 32px; }
+  main { max-width:480px; margin:0 auto; }
+  h1 { font-size:1.4rem; margin:16px 0 8px; }
+  #view { position:relative; width:100%; aspect-ratio:1; background:#000; border-radius:12px; overflow:hidden; }
+  video, #preview { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+  #preview { display:none; }
+  #status { color:var(--muted); font-size:.9rem; min-height:1.3em; margin:8px 0; }
+  .row { display:flex; align-items:center; gap:10px; margin:8px 0; }
+  .name { width:5.5em; } .pct { width:3.6em; text-align:right; font-variant-numeric:tabular-nums; }
+  .track { flex:1; height:14px; background:var(--track); border-radius:7px; overflow:hidden; }
+  .fill { height:100%; width:0; background:var(--bar); }
+  .top .name { font-weight:700; }
+  button, label.btn { font:inherit; padding:10px 14px; border-radius:10px; border:1px solid var(--track); background:var(--card); color:var(--fg); cursor:pointer; display:inline-block; }
+  .btns { display:flex; gap:8px; flex-wrap:wrap; margin:12px 0; }
+  input[type=file] { display:none; }
+  #qr { margin-top:28px; padding:14px; background:var(--card); border-radius:12px; text-align:center; }
+  #qr h2 { font-size:1rem; margin:0 0 10px; }
+  #qrimg { display:inline-block; background:#fff; padding:10px; border-radius:8px; }
+  #qrimg svg { display:block; width:200px; height:200px; }
+  #qr a { display:block; margin-top:10px; word-break:break-all; color:var(--bar); }
+</style>
+</head>
+<body>
+<main>
+  <h1>🍃 Leaf classifier</h1>
+  <div id="view"><video id="video" playsinline muted autoplay></video><canvas id="preview"></canvas></div>
+  <div id="status">Loading model…</div>
+  <div id="bars"></div>
+  <div class="btns">
+    <button id="camBtn" type="button">Start camera</button>
+    <label class="btn">Upload photo<input id="file" type="file" accept="image/*"></label>
+    <button id="checkBtn" type="button">Self-check</button>
+  </div>
+  <div id="checkOut" style="color:var(--muted);font-size:.85rem;white-space:pre-wrap"></div>
+
+  <section id="qr">
+    <h2>Scan this QR code to open this app on your phone</h2>
+    <div id="qrimg"></div>
+    <a id="qrlink" href=""></a>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
+<script>
+const APP_URL = "https://apolenaprikrylova.github.io/mlr-ex08/";
+const $ = id => document.getElementById(id);
+let info, session, inputName, running = false, busy = false, stream = null;
+
+// ---- QR (generated in the browser) ----
+(function () {
+  try {
+    const q = qrcode(0, "M"); q.addData(APP_URL); q.make();
+    $("qrimg").innerHTML = q.createSvgTag({ cellSize: 4, margin: 0, scalable: true });
+  } catch (e) { $("qrimg").textContent = "QR unavailable"; }
+  const a = $("qrlink"); a.href = APP_URL; a.textContent = APP_URL;
+})();
+
+// ---- UI ----
+function buildBars() {
+  $("bars").innerHTML = info.classes.map((c, i) =>
+    `<div class="row" id="r${i}"><span class="name">${c}</span><div class="track"><div class="fill" id="f${i}"></div></div><span class="pct" id="p${i}">–</span></div>`).join("");
+}
+function show(probs) {
+  let best = 0; probs.forEach((p, i) => { if (p > probs[best]) best = i; });
+  probs.forEach((p, i) => {
+    $("f" + i).style.width = (p * 100).toFixed(1) + "%";
+    $("p" + i).textContent = (p * 100).toFixed(1) + "%";
+    $("r" + i).classList.toggle("top", i === best);
+  });
+}
+
+// ---- Model ----
+// source: any drawable with width/height in pixels (sw, sh)
+const work = document.createElement("canvas");
+function preprocess(src, sw, sh) {
+  const n = info.input_size;
+  work.width = work.height = n;
+  const ctx = work.getContext("2d", { willReadFrequently: true });
+  const s = Math.min(sw, sh);                       // central square
+  ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(src, (sw - s) / 2, (sh - s) / 2, s, s, 0, 0, n, n);
+  const d = ctx.getImageData(0, 0, n, n).data;
+  const out = new Float32Array(3 * n * n), plane = n * n;
+  for (let i = 0; i < plane; i++)
+    for (let c = 0; c < 3; c++)
+      out[c * plane + i] = (d[i * 4 + c] / 255 - info.mean[c]) / info.std[c];
+  return new ort.Tensor("float32", out, [1, 3, n, n]);
+}
+function softmax(l) {
+  const m = Math.max(...l), e = Array.from(l, v => Math.exp(v - m)), s = e.reduce((a, b) => a + b, 0);
+  return e.map(v => v / s);
+}
+async function classify(src, sw, sh) {
+  const res = await session.run({ [inputName]: preprocess(src, sw, sh) });
+  const out = res[session.outputNames[0]].data;
+  const sum = Array.from(out).reduce((a, b) => a + b, 0);
+  const isProb = Array.from(out).every(v => v >= 0 && v <= 1) && Math.abs(sum - 1) < 1e-3;
+  return isProb ? Array.from(out) : softmax(out);   // model outputs logits
+}
+
+// ---- Camera ----
+async function startCamera() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+    const v = $("video"); v.srcObject = stream; v.muted = true; await v.play();
+    $("preview").style.display = "none"; v.style.display = "block";
+    running = true; $("camBtn").textContent = "Stop camera"; $("status").textContent = "Live";
+    loop();
+  } catch (e) {
+    $("status").textContent = "Camera unavailable (" + (e.name || e) + "). Use “Upload photo” instead.";
+  }
+}
+function stopCamera() {
+  running = false; if (stream) stream.getTracks().forEach(t => t.stop()); stream = null;
+  $("camBtn").textContent = "Start camera";
+}
+async function loop() {
+  if (!running) return;
+  const v = $("video");
+  if (!busy && v.videoWidth) {
+    busy = true;
+    try { show(await classify(v, v.videoWidth, v.videoHeight)); } catch (e) { $("status").textContent = "Error: " + e.message; }
+    busy = false;
+  }
+  setTimeout(() => requestAnimationFrame(loop), 80);
+}
+$("camBtn").onclick = () => running ? (stopCamera(), $("status").textContent = "Camera stopped") : startCamera();
+
+// ---- Upload fallback ----
+function loadImage(url) {
+  return new Promise((res, rej) => { const im = new Image(); im.onload = () => res(im); im.onerror = () => rej(new Error("cannot load image")); im.src = url; });
+}
+$("file").onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  stopCamera();
+  const url = URL.createObjectURL(f);
+  try {
+    const im = await loadImage(url);
+    const p = $("preview"); p.width = im.naturalWidth; p.height = im.naturalHeight;
+    p.getContext("2d").drawImage(im, 0, 0);
+    p.style.display = "block"; $("video").style.display = "none";
+    show(await classify(im, im.naturalWidth, im.naturalHeight));
+    $("status").textContent = "Photo: " + f.name;
+  } catch (err) { $("status").textContent = "Error: " + err.message; }
+  URL.revokeObjectURL(url); e.target.value = "";
+};
+
+// ---- Self-check against check_expected.json ----
+async function selfCheck() {
+  try {
+    const [im, exp] = await Promise.all([loadImage("check_image.jpg"), fetch("check_expected.json").then(r => r.json())]);
+    const probs = await classify(im, im.naturalWidth, im.naturalHeight);
+    let maxDiff = 0, lines = [];
+    info.classes.forEach((c, i) => { const d = Math.abs(probs[i] - exp[c]); maxDiff = Math.max(maxDiff, d); lines.push(`${c}: got ${probs[i].toFixed(4)}, expected ${exp[c].toFixed(4)}`); });
+    const ok = maxDiff < 0.01;
+    $("checkOut").textContent = (ok ? "PASS" : "FAIL") + " (max diff " + maxDiff.toExponential(2) + ")\n" + lines.join("\n");
+    document.title = "Leaf classifier " + (ok ? "[check PASS]" : "[check FAIL]");
+    return ok;
+  } catch (e) { $("checkOut").textContent = "Self-check error: " + e.message; return false; }
+}
+$("checkBtn").onclick = selfCheck;
+
+// ---- Init ----
+(async () => {
+  try {
+    info = await (await fetch("model_info.json")).json();
+    buildBars();
+    ort.env.wasm.numThreads = 1;                       // no cross-origin isolation needed (Safari)
+    session = await ort.InferenceSession.create("leaf_model.onnx", { executionProviders: ["wasm"] });
+    inputName = session.inputNames[0];
+    $("status").textContent = "Model ready. Start the camera or upload a photo.";
+    if (location.hash === "#check") selfCheck();
+  } catch (e) { $("status").textContent = "Failed to load model: " + e.message; }
+})();
+</script>
+</body>
+</html>
